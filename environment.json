@@ -1,0 +1,14 @@
+[
+  {
+    "name": "air-air",
+    "picture": "air.png"
+  },
+   {
+    "name": "air-sea",
+    "picture": "MSBKHX-3.png"
+  },
+   {
+    "name": "air-ground",
+    "picture": "ground.png"
+  }
+]
