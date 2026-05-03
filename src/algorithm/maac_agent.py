@@ -1,4 +1,4 @@
-from dc_master_step.algorithm.prioritized_replay_buffer import PrioritizedReplayBuffer
+from src.algorithm.prioritized_replay_buffer import PrioritizedReplayBuffer
 from typing import List
 
 import numpy as np
@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from dc_master_step.algorithm.actor import Actor
-from dc_master_step.algorithm.critic import Critic
+from src.algorithm.actor import Actor
+from src.algorithm.critic import Critic
 
 class MAACAgent:
     def __init__(

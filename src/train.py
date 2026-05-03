@@ -13,8 +13,8 @@ matplotlib.use('Agg')  # 使用非交互式后台，以免误弹出GUI窗口
 
 if __name__ == "__main__":
     # 创建保存模型和图形的目录
-    os.makedirs("models_path0", exist_ok=True)
-    os.makedirs("figures_path0", exist_ok=True)
+    os.makedirs("models_path", exist_ok=True)
+    os.makedirs("figures_path", exist_ok=True)
 
     # 设置随机种子，保证实验可重复
     np.random.seed(0)

@@ -406,8 +406,8 @@ class BattleField:
                             num_of_red_alive += 1
                             sum_efficiency_per_step += unit.spectrum_efficiency
 
-                        print(unit.color + unit.name + str(unit.unitIndex) + "频谱利用率" + str(unit.spectrum_efficiency) +
-                              "雷达探测距离" + str(unit.radar.dis))
+                        # print(unit.color + unit.name + str(unit.unitIndex) + "频谱利用率" + str(unit.spectrum_efficiency) +
+                        #       "雷达探测距离" + str(unit.radar.dis))
 
                 sum_efficiency_per_step /= num_of_red_alive
 
