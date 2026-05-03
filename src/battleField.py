@@ -1,5 +1,3 @@
-from gc import set_debug
-
 import numpy as np
 import time
 import tkinter as tk
@@ -7,6 +5,310 @@ from PIL import Image, ImageTk
 import json
 import matplotlib.pyplot as plt
 import random
+
+# TODO 添加一个安全的 arccos 函数，确保输入在 [-1,1] 范围内
+def safe_arccos(x):
+    return np.arccos(np.clip(x, -1.0, 1.0))
+
+MAX_TRAJ_LEN = 1500  # 单架飞机最多保留的轨迹点数
+
+
+class ThreatIndex:
+    def __init__(self,
+                 battleField,
+                 unit=None,
+                 ):
+        self.battleField = battleField
+        self.unit = unit
+        # 对我方单位的威胁矩阵（二维矩阵，行数为敌方单位数，列数为我方单位数）
+        # 即threatMatrix[i][j]表示unit[i]对unit[j]的威胁因子
+        self.threatMatrix = []
+        self.enemies = []
+        self.allies = []
+
+    def angle_threat_factor(self, unit1, unit2):
+        '''
+        计算unit1对unit2的角度威胁因子
+        :param unit1: 空战单位1
+        :param unit2: 空战单位2
+        :return: 威胁因子
+        '''
+        Ta = 0
+        # U2指向U1的位置向量
+        D = [unit1.position[0] - unit2.position[0], unit1.position[1] - unit2.position[1],
+             unit1.position[2] - unit2.position[2]]
+        # 敌机速度向量
+        V1 = [unit1.state[3], unit1.state[4], unit1.state[5]]
+        # 我机速度向量
+        V2 = [unit2.state[3], unit2.state[4], unit2.state[5]]
+        # 敌机进入角
+        theta1 = safe_arccos(np.dot(D, V1) / (np.linalg.norm(D) * np.linalg.norm(V1)))
+        # 我机位置角
+        theta2 = safe_arccos(np.dot(D, V2) / (np.linalg.norm(D) * np.linalg.norm(V2)))
+
+        Ta = (abs(theta1) + abs(theta2)) / (2 * np.pi)
+        return Ta
+
+    def velocity_threat_factor(self, unit1, unit2):
+        '''
+        计算unit1对unit2的速度威胁因子
+        :param unit1: 空战单位1
+        :param unit2: 空战单位2
+        :return: 威胁因子
+        '''
+        # 速度威胁因子
+        Tv = 0
+        if 0.6 * unit2.speed > unit1.speed:
+            Tv = 0.1
+        elif 1.5 * unit2.speed >= unit1.speed:
+            Tv = -0.5 + unit1.speed / unit2.speed
+        else:
+            Tv = 1.0
+        return Tv
+
+    def height_threat_factor(self, unit1, unit2):
+        '''
+        计算unit1对unit2的高度威胁因子
+        :param unit1: 空战单位1
+        :param unit2: 空战单位2
+        :return: 威胁因子
+        '''
+
+        # U1和U2的高度差
+        H = abs(unit2.position[2] - unit1.position[2])
+        #设置门限高度，若H超过H0，则说明一方有绝对的高度优势
+        H0 = 7
+        # 高度威胁因子
+        Th = 0
+        sigma_h = 0.5  # sigma_h越大，高度威胁因子Th越大；sigma_h越小，Th越小
+        if H > H0:
+            Th = 1
+        else:
+            Th = np.exp(-((H - H0) / sigma_h) ** 2)
+        return Th
+
+    def distance_threat_factor(self, unit1, unit2):
+        '''
+        计算unit1对unit2的距离威胁因子
+        1、当U1被干扰时 2、当U1未被干扰
+        :param unit1: 空战单位1
+        :param unit2: 空战单位2
+        :return: 距离威胁因子
+        '''
+        # 距离威胁因子
+        Td = 0
+        # U1和U2的距离
+        distance = self.battleField.get_distance(unit1.position, unit2.position)
+        # 当U1被干扰
+        if unit1.lockedByBeamList:
+            # 如果U1携带反辐射导弹
+            if hasattr(unit1, 'missile'):
+                if unit1.missile.antiRadiationMissileNum > 0:
+                    # 如果是U2干扰了U1
+                    for lockedBeam in unit1.lockedByBeamList:
+                        if lockedBeam.target == unit2:
+                            if distance <= unit1.antiAttackRange:
+                                Td = 10
+                            else:
+                                Td = 10 - (distance - unit1.antiAttackRange) / unit1.antiAttackRange
+                                if Td < 0:
+                                    Td = 0
+
+                        else:
+                            if distance <= unit1.linkDistance:
+                                Td = 1
+                            else:
+                                Td = (1 - (distance - unit1.linkDistance) / unit1.linkDistance)
+                                if Td < 0:
+                                    Td = 0
+            # 如果U1没有携带反辐射导弹
+            else:
+                if distance <= unit1.linkDistance:
+                    Td = 1
+                else:
+                    Td = (1 - (distance - unit1.linkDistance) / unit1.linkDistance)
+                    if Td < 0:
+                        Td = 0
+
+
+        # 当U1未被干扰
+        else:
+            # 当U1雷达开且U2雷达关
+            if unit1.radar.on and not unit2.radar.on:
+                if distance <= unit1.radar.calculate_max_detection_distance():
+                    Td = 0.5 + 0.5 * ((unit1.radar.calculate_max_detection_distance() - distance)
+                                      / unit1.radar.calculate_max_detection_distance())
+                else:
+                    Td = (1 - (distance - unit1.radar.calculate_max_detection_distance())
+                          / unit1.radar.calculate_max_detection_distance())
+                    if Td < 0:
+                        Td = 0
+
+            # 当U1雷达关且U2雷达开
+            if not unit1.radar.on and unit2.radar.on:
+                # 距离小于U1的导弹攻击范围
+                if distance <= unit1.attackRange:
+                    Td = 1
+                else:
+                    Td = (1 - (distance - unit1.attackRange) / unit1.attackRange)
+                    if Td < 0:
+                        Td = 0
+
+            # 当U1雷达开且U2雷达开
+            if unit1.radar.on and unit2.radar.on:
+                # U1雷达探测范围大于U2雷达探测范围 且 U1的攻击范围大于U2的攻击范围
+                if unit1.radar.calculate_max_detection_distance() > unit2.radar.calculate_max_detection_distance() \
+                        and unit1.attackRange > unit2.attackRange:
+                    if unit1.radar.calculate_max_detection_distance() >= distance > unit2.radar.calculate_max_detection_distance():
+                        Td = 0.4 - 0.4 * ((distance - unit2.radar.calculate_max_detection_distance())
+                                          / (
+                                                  unit1.radar.calculate_max_detection_distance() - unit2.radar.calculate_max_detection_distance()))
+                    if unit1.radar.calculate_max_detection_distance() < distance:
+                        Td = 0
+                    if unit2.radar.calculate_max_detection_distance() >= distance > unit1.attackRange:
+                        Td = 1 - 0.6 * ((distance - unit1.attackRange)
+                                        / (unit2.radar.calculate_max_detection_distance() - unit1.attackRange))
+                    if unit1.attackRange >= distance > unit2.attackRange:
+                        Td = 0.5 + 0.5 * ((distance - unit2.attackRange)
+                                          / (unit1.attackRange - unit2.attackRange))
+                    if unit2.attackRange > distance:
+                        Td = 0.5 + 0.3 * ((unit2.attackRange - distance) / unit2.attackRange)
+                # U1雷达探测范围大于U2雷达探测范围 但 U1的攻击范围小于U2的攻击范围
+                if (unit1.radar.calculate_max_detection_distance() > unit2.radar.calculate_max_detection_distance()
+                        and unit1.attackRange < unit2.attackRange):
+                    if unit1.radar.calculate_max_detection_distance() >= distance > unit2.radar.calculate_max_detection_distance():
+                        Td = 0.4 - 0.4 * ((distance - unit2.radar.calculate_max_detection_distance())
+                                          / (
+                                                  unit1.radar.calculate_max_detection_distance() - unit2.radar.calculate_max_detection_distance()))
+                    if unit1.radar.calculate_max_detection_distance() < distance:
+                        Td = 0
+                    if unit2.attackRange >= distance > unit1.attackRange:
+                        Td = 0.5 - 0.1 * ((distance - unit1.attackRange)
+                                          / (unit2.attackRange - unit1.attackRange))
+                    if unit1.attackRange >= distance:
+                        Td = 0.5 + 0.5 * (unit1.attackRange - distance) / unit1.attackRange
+                    if unit2.radar.calculate_max_detection_distance() > distance >= unit2.attackRange:
+                        Td = 0.4 + 0.4 * ((unit2.radar.calculate_min_detection_distance() - distance) / (
+                                unit2.radar.calculate_max_detection_distance() - unit2.attackRange))
+
+                # U1雷达探测范围小于U2雷达探测范围 但U1的攻击范围大于U2的攻击范围
+                if unit1.radar.calculate_max_detection_distance() < unit2.radar.calculate_max_detection_distance() and unit1.attackRange > unit2.attackRange:
+                    if unit2.attackRange >= distance:
+                        Td = 0.5 + 0.3 * ((unit2.attackRange - distance) / unit2.attackRange)
+                    if unit1.attackRange >= distance > unit2.attackRange:
+                        Td = 0.5 + 0.5 * ((distance - unit2.attackRange)
+                                          / (unit1.attackRange - unit2.attackRange))
+                    if unit1.radar.calculate_max_detection_distance() >= distance > unit1.attackRange:
+                        Td = 1 - 0.7 * ((distance - unit1.attackRange)
+                                        / (unit1.radar.calculate_max_detection_distance() - unit1.attackRange))
+                    if unit2.radar.calculate_max_detection_distance() >= distance > unit1.radar.calculate_max_detection_distance():
+                        Td = 0.3 - 0.3 * ((distance - unit1.radar.calculate_max_detection_distance())
+                                          / (
+                                                  unit2.radar.calculate_max_detection_distance() - unit1.radar.calculate_max_detection_distance()))
+                    if distance > unit2.radar.calculate_max_detection_distance():
+                        Td = 0
+                # U1雷达探测范围小于U2雷达探测范围 且U1的攻击范围小于U2的攻击范围
+                if (unit1.radar.calculate_max_detection_distance() < unit2.radar.calculate_max_detection_distance()
+                        and unit1.attackRange < unit2.attackRange):
+                    if distance > unit2.radar.calculate_max_detection_distance():
+                        Td = 0
+                    if unit2.radar.calculate_max_detection_distance() >= distance > unit1.radar.calculate_max_detection_distance():
+                        Td = 0.1 - 0.1 * ((distance - unit1.radar.calculate_max_detection_distance())
+                                          / (
+                                                  unit2.radar.calculate_max_detection_distance() - unit1.radar.calculate_max_detection_distance()))
+                    if unit1.radar.calculate_max_detection_distance() >= distance > unit2.attackRange:
+                        Td = 0.1 + 0.1 * ((unit1.radar.calculate_max_detection_distance() - distance)
+                                          / (unit1.radar.calculate_max_detection_distance() - unit2.attackRange))
+                    if unit2.attackRange >= distance > unit1.attackRange:
+                        Td = 0.5 - 0.3 * ((distance - unit1.attackRange)
+                                          / (unit2.attackRange - unit1.attackRange))
+                    if unit1.attackRange >= distance:
+                        Td = 0.5 + 0.3 * ((unit1.attackRange - distance) / unit1.attackRange)
+
+            # 当U1雷达关且U2雷达关
+            if hasattr(unit1, 'missile'):
+                if not unit1.radar.on and not unit2.radar.on:
+                    if distance <= unit1.missile.range:
+                        Td = 1
+                    else:
+                        Td = (1 - (distance - unit1.missile.range) / unit1.missile.range)
+                        if Td < 0:
+                            Td = 0
+            # 如果U1没有导弹
+            else:
+                Td = 0
+
+        return Td
+
+    def rcs_threat_factor(self, unit1, unit2):
+        '''
+        计算unit1对unit2的隐身威胁因子
+        :param unit1: 空战单位1
+        :param unit2: 空战单位2
+        :return: 隐身威胁因子
+        '''
+
+        # 隐身威胁因子
+        Tr = 0
+        sigma_r = 0.5  # sigma_r越大，隐身威胁因子Tr越大；sigma_r越小，Tr越小
+        # 门限rcs 超过门限rcs说明一方有绝对隐身优势
+        S0 = 1.5
+        # U1和U2的rcs
+        RCS1 = unit1.rcs
+        RCS2 = unit2.rcs
+        if RCS2 - RCS1 > S0:
+            Tr = 1
+        else:
+            Tr = np.exp(-((RCS2 - RCS1 - S0) / sigma_r) ** 2)
+        return Tr
+
+    # todo：new
+    def update_threat_matrix(self):
+        """重构后的威胁矩阵更新方法"""
+        self.threatMatrix = []
+
+        # todo:在这里修改敌我
+        # 明确区分敌我单位
+        self.allies = [u for u in self.battleField.unitList
+                        if u.color == 'blue' and not u.crashed]
+        self.enemies = [u for u in self.battleField.unitList
+                       if u.color == 'red' and not u.crashed]
+
+        # 构建矩阵：行->敌方单位，列->我方单位
+        # 仅对于我方雷达探测到的敌方单位进行威胁计算
+        # 对于未被雷达探测到的敌方单位，威胁因子为0
+        for enemy in self.unit.radar.detectedUnits:
+            threat_row = []
+            for ally in self.allies:
+                if enemy in self.unit.radar.detectedUnits:
+                    threat = self.calculate_dynamic_threat(enemy, ally)
+                else:
+                    threat = 0
+                threat_row.append(threat)
+            self.threatMatrix.append(threat_row)
+
+    def calculate_dynamic_threat(self, enemy, ally):
+        """双参数版威胁计算"""
+        weights = {
+            'distance': 0.8,
+            'angle': 0.2,
+            'speed': 0.2,
+            'rcs': 0.1,
+            'height': 0.1
+        }
+
+        Td = self.distance_threat_factor(enemy, ally)
+        Ta = self.angle_threat_factor(enemy, ally)  # 注意参数顺序
+        Tv = self.velocity_threat_factor(enemy, ally)
+        Tr = self.rcs_threat_factor(enemy, ally)
+        Th = self.height_threat_factor(enemy, ally)
+
+        return (weights['distance'] * Td +
+                weights['angle'] * Ta +
+                weights['speed'] * Tv +
+                weights['rcs'] * Tr +
+                weights['height'] * Th)
+
 
 
 #战场类, 用于设定战场的时空参数，创建战场画布，计算时空量，统计战场上的所有装备
@@ -51,8 +353,9 @@ class BattleField:
         self.linkMatrixChanged = False
         self.networkList = []
         self.networkConectionMatrix = None
-
         self.window = tk.Tk()
+        self.window.withdraw()
+        self.window = tk.Toplevel()
         self.window.title("Battle Field")
         self.window.geometry('%dx%d' % (size[0], size[1]))
         self.canvas = tk.Canvas(self.window,
@@ -64,6 +367,22 @@ class BattleField:
         self.canvas.grid()
 
         self.jammedDict = {}  # 受扰字典，结构为 {target: [fc, Bw, Pi],...}
+
+    # 1) 轨迹记录辅助方法
+    # ------------------------------------------------------------------
+    def _update_path_history(self):
+        """为所有仍存活的空中单位记录当前位置。"""
+        for unit in self.unitList:
+            # 只记录空中单位；可按需自行扩展类型判断条件
+            if unit.name in ("EWA", "EJA", "fighter") and not unit.crashed:
+                # 初始化轨迹列表
+                if not hasattr(unit, "path_history"):
+                    unit.path_history = []
+                # 追加当前三维坐标 (x, y, z)
+                unit.path_history.append(tuple(unit.position))
+                # 裁剪长度，避免内存暴涨
+                if len(unit.path_history) > MAX_TRAJ_LEN:
+                    unit.path_history.pop(0)
 
     #添加装备
     def add_unit(self, unit):
@@ -157,7 +476,13 @@ class BattleField:
                 for link in self.singleConectedLinkList:
                     senderNetworkIndex = link[0].communicator.networkIndex
                     receiverNetworkIndex = link[1].communicator.networkIndex
-                    self.networkConectionMatrix[senderNetworkIndex, receiverNetworkIndex] = True
+
+                    if 0 <= senderNetworkIndex < networkNum and 0 <= receiverNetworkIndex < networkNum:
+                        # todo: 下面这一行偶尔报错，原因未知
+                        self.networkConectionMatrix[senderNetworkIndex, receiverNetworkIndex] = True
+                    else:
+                        # print(f"Invalid network indices: sender={senderNetworkIndex}, receiver={receiverNetworkIndex}")
+                        pass
         # end1 = time.time()
         # print('time1 =', end1-begin1)
 
@@ -241,13 +566,13 @@ class BattleField:
 
         # 计算方向
         horizontal_distance = np.sqrt(np.square(diff[:, :, 0]) + np.square(diff[:, :, 1]))  #水平距离
-        self.orientationMatrix = np.arccos(diff[:, :, 0] / (horizontal_distance + 1e-10)) * np.sign(diff[:, :, 1])
+        self.orientationMatrix = safe_arccos(diff[:, :, 0] / (horizontal_distance + 1e-10)) * np.sign(diff[:, :, 1])
 
         # 计算俯仰角(-兀/2，兀/2)
         self.pitchMatrix = np.arctan2(diff[:, :, 2], horizontal_distance)  # z轴与水平距离的比值
 
-        #self.orientationMatrix = np.pi + (np.arccos(diff[:, :, 0] / self.distanceMatrix) - np.pi) * np.sign(diff[:, :, 1])
-        # self.orientationMatrix = np.arccos(diff[:, :, 0] / self.distanceMatrix) * np.sign(diff[:, :, 1])
+        #self.orientationMatrix = np.pi + (safe_arccos(diff[:, :, 0] / self.distanceMatrix) - np.pi) * np.sign(diff[:, :, 1])
+        # self.orientationMatrix = safe_arccos(diff[:, :, 0] / self.distanceMatrix) * np.sign(diff[:, :, 1])
         self.influenceMatrix = ((self.distanceMatrix - np.array(self.maxInfluenceDistanceList)) < 0)
 
         #self.detectionMatrix = \
@@ -275,7 +600,7 @@ class BattleField:
         horizontal_distance = np.sqrt(xDiff ** 2 + yDiff ** 2)
 
         # 计算方向角（平面上的角度）
-        orientation = np.arccos(xDiff / (horizontal_distance + 1e-10))  # 避免除以0
+        orientation = safe_arccos(xDiff / (horizontal_distance + 1e-10))  # 避免除以0
         if yDiff < 0:
             orientation = 2 * np.pi - orientation
 
@@ -319,11 +644,11 @@ class BattleField:
             sumTime4 = 0
             sumTime5 = 0
             sumTime6 = 0
+
             begin = time.time()
             sum_efficiency_per_frame = 0.0
 
             while simNum < self.simNumPerFrame:  # 运行的步数小于更新图像所需的步数，就继续运行
-                sim_step += 1
                 # 导弹行动
                 begin1 = time.time()
                 for missile in self.flyingMissileList:
@@ -379,6 +704,7 @@ class BattleField:
                 #        unit.communicator.communication()
 
                 begin3 = time.time()
+
                 sum_efficiency_per_step = 0.0
                 num_of_red_alive = 0
                 for unit in self.unitList:
@@ -399,7 +725,7 @@ class BattleField:
                             unit.spectrum_efficiency += 0.5
                         elif unit.radar.dis > 200 and unit.name == 'EWA':
                             unit.spectrum_efficiency += 0.5
-                        elif unit.radar.dis > 50 and unit.name != 'EWA' and unit.name != 'Destroyer':
+                        elif unit.radar.dis > 60 and unit.name != 'EWA' and unit.name != 'Destroyer':
                             unit.spectrum_efficiency += 0.5
 
                         if unit.color == 'red':
@@ -429,7 +755,6 @@ class BattleField:
                 #print('avgJammingTimeRatio =', avgTime4)
 
             sum_efficiency_per_frame /= self.simNumPerFrame
-
 
             end = time.time()
             runtime = end - begin
@@ -467,23 +792,18 @@ class BattleField:
             #     if linkDistance >= distance:
             self.displayLinks()
 
-            for missile in self.flyingMissileList:
-                missile.display()
-
-            sum_efficiency_averaged = global_sum_efficiency / sim_step
+            sum_efficiency_averaged = global_sum_efficiency / (sim_step+1)
             self.canvas.create_text(100, 560, text="平均频谱利用率：{:.4f}".format(sum_efficiency_averaged), fill='red',
                                     font=('Arial', 12))
-            self.canvas.create_text(100, 580, text="时隙频谱利用率：{:.4f}".format(sum_efficiency_per_frame), fill='red',
+            self.canvas.create_text(100, 580, text=f"平均频谱利用率：{sum_efficiency_per_frame}", fill='red',
                                     font=('Arial', 12))
 
-
+            for missile in self.flyingMissileList:
+                missile.display()
             self.window.update()
             if self.timer > self.simDuration:
                 break
         self.window.mainloop()
-
-        sum_efficiency_averaged = global_sum_efficiency / sim_step
-        print(f'整局己方平均频谱利用率：{sum_efficiency_averaged}')
 
     def step(self):
         self.initialize_links()
@@ -496,7 +816,7 @@ class BattleField:
 
         tkimg = ImageTk.PhotoImage(img)
 
-        EWAimg = ImageTk.PhotoImage(Image.open("../EWA.png"))
+        EWAimg = ImageTk.PhotoImage(Image.open("EWA.png"))
 
         for unit in self.unitList:
             if not unit.crashed:
@@ -619,6 +939,402 @@ class BattleField:
                 break
         self.window.mainloop()
 
+        # ======================
+        # TODO 以下增加用于强化学习的接口方法
+        # ======================
+
+    def get_state(self):
+        """
+        对每个红方战斗机 rf，返回它与场上所有其他单位的相对位置向量。
+        若目标单位 u.crashed == True，则用 [-1, -1, -1] 作为占位。
+        输出 shape: (num_red, (num_total-1)*3)
+        """
+        red_fighters = [u for u in self.unitList if u.color == 'red' and u.name == 'fighter']
+        state = []
+        for rf in red_fighters:
+            rel_list = []
+            for unit in self.unitList:
+                if unit is rf:
+                    continue  # 跳过自身
+                if unit.crashed:  # 坠毁,相对位置为[-1,-1,-1]
+                    rel_list.extend([-1.0, -1.0, -1.0])
+                else:
+                    rel = np.array(unit.position) - np.array(rf.position)
+                    rel_list.extend(rel.tolist())
+            state.append(rel_list)
+        return np.asarray(state, dtype=np.float32)
+
+    def reset(self):
+        predefined_positions = [
+            [900., 400., 10],
+            [855., 435., 10],
+            [900., 450., 10],
+            [925., 444., 10],
+            [900., 450., 10],
+            [925., 444., 10],
+            [925., 444., 10],
+            [650., 700., 0],  # 蓝方驱逐舰
+            [675., 765., 0],
+            [700., 790., 0],
+            [150., 100., 10],
+            [150., 150., 10],
+            [150 + random.randint(-70, 70), 100 + random.randint(-70, 70), 10],  # 红方战斗机
+            [150 + random.randint(-70, 70), 100 + random.randint(-70, 70), 10],
+            [150 + random.randint(-70, 70), 100 + random.randint(-70, 70), 10],
+            [150 + random.randint(-70, 70), 100 + random.randint(-70, 70), 10],
+            [150 + random.randint(-70, 70), 100 + random.randint(-70, 70), 10],
+            [120., 200., 0],  # 红方驱逐舰
+            [145., 225., 0],
+            [170., 270., 0],
+        ]
+
+        # ---------- 彻底清理上一回合残留 ----------
+        self.canvas.delete("all")  # 清空画布
+        # 清空所有在飞导弹列表
+        self.flyingMissileList.clear()
+        # 清空坠毁单位列表
+        self.crashedUnitList.clear()
+        # 清除干扰链路记录
+        self.jammedLinkList.clear()
+        self.jammedDict.clear()
+
+        for unit in self.unitList:
+            # 1) 清空延迟任务，防止旧的 attack() 重新触发
+            unit.schedule.clear()
+
+            # 2) 清空和导弹相关的临时列表
+            unit.aimingTargetList.clear()
+            unit.trackedByMissileList.clear()
+            unit.targetedByList.clear()
+            unit.lockedByBeamList.clear()
+
+            unit.normalMissileList.clear()
+            unit.antiRadiationMissileList.clear()
+
+            # 3) 重置攻击通道
+            for chan in unit.attackChannelList:
+                chan.missileList.clear()
+                chan.reset()  # 令 chan.target = None 并归还通道
+
+            unit.availableAttackChannelNum = unit.maxAttackChannelNum
+
+            # 重置导弹列表
+            if unit.name == 'fighter':
+                for i in range(unit.normalMissileNum):
+                    missile = Missile(battleField=self,
+                                      name='fox%d' % i,
+                                      speed=Plane_Missile_speed,
+                                      type='normal',
+                                      unit=unit,
+                                      )
+                    unit.normalMissileList.append(missile)
+                for i in range(unit.antiRadiationMissileNum):
+                    missile = Missile(battleField=self,
+                                      name='fox%d' % i,
+                                      type='antiRadiation',
+                                      speed=Plane_Missile_speed,
+                                      unit=unit,
+                                      )
+                    unit.antiRadiationMissileList.append(missile)
+
+            if unit.name == 'Destroyer':
+                for i in range(unit.normalMissileNum):
+                    missile = Missile(battleField=self,
+                                      name='fox%d' % i,
+                                      speed=Destroyer_Missile_speed,
+                                      type='normal',
+                                      unit=unit,
+                                      )
+                    unit.normalMissileList.append(missile)
+                for i in range(unit.antiRadiationMissileNum):
+                    missile = Missile(battleField=self,
+                                      name='fox%d' % i,
+                                      type='antiRadiation',
+                                      speed=Destroyer_Missile_speed,
+                                      unit=unit,
+                                      )
+                    unit.antiRadiationMissileList.append(missile)
+
+        # 3) 重置所有单位的位置和状态
+        for unit, pos in zip(self.unitList, predefined_positions):
+            unit.position = pos
+            unit.state = pos + [0.0, 0.0, 0.0]  # 初始速度设为0
+            unit.crashed = False
+            # 重置传感器和设备状态
+            unit.radar.detectedUnits = []
+            unit.monitor.recvBeamList = []
+            # 彻底移除旧干扰波束
+            for beam in list(unit.jammer.beamList):  # 用 list() 拷贝，避免遍历时修改
+                beam.close()  # 彻底解除锁定 / 干扰关系
+            # 2) 清空 Jammer 内部所有与波束相关的缓存
+            unit.jammer.beamList.clear()
+            unit.jammer.targetBeamList.clear()
+            unit.jammer.directionList.clear()
+            unit.jammer.directionPitchList.clear()
+            unit.jammer.angleRangeList.clear()
+            unit.jammer.pitchRangeList.clear()
+            unit.jammer.maxEffectiveDistanceList.clear()
+            unit.jammer.currentEffectiveDistanceList.clear()
+            # 重置轨迹
+            unit.path_history = []
+        self.timer = 0
+        # 更新全局位置列表和关系矩阵
+        self.positionList = [unit.position for unit in self.unitList]
+
+        # 重置通信链路和雷达等设备的状态
+        self.linkMatrix = np.zeros([len(self.unitList), len(self.unitList)], dtype=np.bool_)
+        self.maxLinkDistanceMatrix = -np.ones([len(self.unitList), len(self.unitList)])
+
+        self.battlefield_situation()  # 确保矩阵初始化
+        # 初始化单位链接关系
+        self.initialize_links()
+        # 获取初始状态
+        state = self.get_state()
+        return state
+
+    def get_blue_eja_position(self):
+        """ 获取所有蓝方干扰机的位置的中位数位置；若已全部被击毁则返回 None """
+        blue_eja_pos = [u.position for u in self.unitList
+                      if u.color == 'blue' and u.name == 'EJA' and not u.crashed]
+        return np.median(blue_eja_pos, axis=0) if blue_eja_pos else None
+
+    def get_blue_destroyer_position(self):
+        """ 获取所有蓝方驱逐舰的位置的中位数位置；若已全部被击毁则返回 None """
+        blue_destroyer_pos = [u.position for u in self.unitList
+                      if u.color == 'blue' and u.name == 'Destroyer' and not u.crashed]
+        return np.median(blue_destroyer_pos, axis=0) if blue_destroyer_pos else None
+
+    def has_alive_blue_eja(self):
+        """判断是否仍有蓝方干扰机存活"""
+        return any(u.color == 'blue' and u.name == 'EJA' and not u.crashed
+                   for u in self.unitList)
+
+    def compute_direction_reward(self, current_pos, target_pos, action):
+        """ 计算方向奖励：动作方向与目标方向的一致性 """
+        pos_vec = np.array(target_pos) - np.array(current_pos)  # 从当前位置指向目标位置的向量
+        if np.linalg.norm(pos_vec) < 1e-6:
+            return 0.0
+        pos_vec_norm = pos_vec / np.linalg.norm(pos_vec)
+        action_vec = np.array(action)
+        if np.linalg.norm(action_vec) < 1e-6:
+            return 0.0
+        action_vec_norm = action_vec / np.linalg.norm(action_vec)
+        # 奖励为两个方向单位向量的点积，范围[-1,1]，越接近1表示朝向目标的动作越一致
+        reward = np.dot(pos_vec_norm, action_vec_norm)
+        return reward
+
+    def compute_distance_reward(self, current_pos, target_pos, action):
+        """ 奖励有效缩短与目标距离的动作 """
+        old_distance = np.linalg.norm(np.array(target_pos) - np.array(current_pos))
+        # 模拟执行当前动作后的位置（假设动作向量即为移动方向和距离的缩放）
+        new_position = np.array(current_pos) + np.array(action)  # 简化：直接将动作向量加到当前位置
+        new_distance = np.linalg.norm(np.array(target_pos) - new_position)
+        # 奖励为距离减少量（正值表示距离变近）
+        reward = old_distance - new_distance
+        # 对距离奖励进行裁剪，防止单步奖励过大造成不稳定
+        reward = float(np.clip(reward, -1.0, 1.0))
+        return reward
+
+    def compute_hybrid_reward(self, current_pos, target_pos, action, alpha=0.5, beta=0.5):
+        """ 组合方向奖励和距离奖励的混合奖励 """
+        dir_reward = self.compute_direction_reward(current_pos, target_pos, action)
+        dist_reward = self.compute_distance_reward(current_pos, target_pos, action)
+        # 以加权和形式组合两个奖励分量
+        reward = alpha * dir_reward + beta * dist_reward
+        return reward
+
+    def rl_step(self, actions):
+        """
+        在强化学习训练时，每调用一次 rl_step 就模拟 simNumPerFrame 步：
+          1) 为每个单位设置其动作；
+          2) 在一个 for 循环内，逐步执行导弹行动、战场态势更新、干扰、雷达检测、通信、单位自身动作等；
+          3) 在每步计算并累加奖励；
+          4) 若检测到任一方全部被摧毁，则结束本 Episode；
+          5) 返回 next_state, cumulative_reward, done, info。
+        """
+
+        # 2) 连续 sim_steps 次模拟
+        sum_efficiency_per_frame = 0.0
+        sim_steps = 1
+        cumulative_reward = [0, 0, 0, 0, 0]
+        done = False  # 是否完成
+        is_win = False
+
+        for _ in range(sim_steps):
+            # a) 导弹行动
+            for missile in self.flyingMissileList:
+                missile.action()
+
+            # b) 更新战场情况(距离、角度等)
+            self.battlefield_situation()
+
+            # c) 干扰器行动
+            for unit in self.unitList:
+                if not unit.crashed and unit.jammer.on:
+                    unit.jammer.jamming()
+
+            # d) 雷达检测
+            for unit in self.unitList:
+                if not unit.crashed and unit.radar.on:
+                    unit.radar.detection()
+
+            # e) 监视器行动
+            for unit in self.unitList:
+                if not unit.crashed and unit.monitor.on:
+                    unit.monitor.monitoring()
+
+            # f) 通信
+            self.communication()
+
+            # g) 执行单位自身的动作，包含统计频谱利用率
+            sum_efficiency_per_step = 0.0
+            num_of_red_alive = 0
+            action_idx = 0
+            for unit in self.unitList:
+                # 频谱利用率计算部分
+                unit.spectrum_efficiency = 0
+                if not unit.crashed:
+                    # 如果通信链路全断
+                    if np.all(~self.linkMatrix[unit.unitIndex, :]):
+                        unit.spectrum_efficiency += 0
+                    else:
+                        unit.spectrum_efficiency += 0.5
+                    unit.radar.cal_detection_range()
+
+                    if unit.radar.dis > 100 and unit.name == 'Destroyer':
+                        unit.spectrum_efficiency += 0.5
+                    elif unit.radar.dis > 200 and unit.name == 'EWA':
+                        unit.spectrum_efficiency += 0.5
+                    elif unit.radar.dis > 60 and unit.name != 'EWA' and unit.name != 'Destroyer':
+                        unit.spectrum_efficiency += 0.5
+
+                    if unit.color == 'red':
+                        num_of_red_alive += 1
+                        sum_efficiency_per_step += unit.spectrum_efficiency
+
+                # 强化学习动作执行部分
+                if unit.color == 'red' and unit.name == 'fighter':
+                    if unit.crashed:
+                        # 坠毁的红方单位仍占一个动作位，跳过以保持索引同步
+                        action_idx += 1
+                        continue
+                    unit.action_red(actions[action_idx])  # 执行对应红方动作
+                    action_idx += 1
+                else:
+                    if unit.crashed:
+                        continue  # 跳过坠毁的其他单位
+                    unit.action()  # 其他单位按内置策略行动
+
+            sum_efficiency_per_step /= num_of_red_alive
+            sum_efficiency_per_frame += sum_efficiency_per_step
+            # 单位自身动作执行完毕后，记录轨迹 ===
+            self._update_path_history()
+            # h) 时间推进
+            self.timer += self.simTimeInterval
+
+            # i) 设置奖励，只保留方向 + 距离的混合奖励，优先靠近干扰机；干扰机被击毁后改为靠近驱逐舰
+            step_rewards = [0, 0, 0, 0, 0]
+            blue_eja_pos = self.get_blue_eja_position()  # 可能为 None
+            blue_destroyer_pos = self.get_blue_destroyer_position()
+            for idx, unit in enumerate([u for u in self.unitList if u.color == 'red' and u.name == 'fighter']):
+                if unit.crashed:
+                    continue  # 坠毁单位不计算奖励
+                # 目标优先级：干扰机 > 驱逐舰
+                if blue_eja_pos is not None:  # 干扰机仍在，奖励朝向干扰机
+                    target = blue_eja_pos
+                else:  # 干扰机全灭，转而奖励靠近驱逐舰
+                    target = blue_destroyer_pos
+                if target is not None:
+                    c_reward = self.compute_hybrid_reward(unit.position, target,
+                                                        actions[idx], alpha=0.5, beta=0.5)
+                    step_rewards[idx] += c_reward
+
+            # 检查双方驱逐舰的存活状态
+            red_destroyer_alive = [u for u in self.unitList if
+                                   u.color == 'red' and not u.crashed and u.name == 'Destroyer']
+            blue_destroyer_alive = [u for u in self.unitList if
+                                    u.color == 'blue' and not u.crashed and u.name == 'Destroyer']
+
+            # 检查红方战斗机的存活状态
+            red_fighter_alive = [u for u in self.unitList if u.color == 'red' and not u.crashed and u.name == 'fighter']
+
+            # ----- 终局判定部分（添加胜利/失败额外奖励）-----
+            # 战斗机全部被击毁游戏结束
+            if len(red_fighter_alive) == 0:
+                done = True
+
+            if len(blue_destroyer_alive) == 0:  # 蓝方驱逐舰被摧毁
+                done = True
+                is_win = True  # 标记获胜
+
+            if len(red_destroyer_alive) == 0:  # 红方驱逐舰被摧毁
+                done = True
+
+            # 累加本轮奖励
+            cumulative_reward[0] += step_rewards[0]
+            cumulative_reward[1] += step_rewards[1]
+            cumulative_reward[2] += step_rewards[2]
+            cumulative_reward[3] += step_rewards[3]
+            cumulative_reward[4] += step_rewards[4]
+
+            # 如果当前 Episode 已结束，则提前跳出
+            if done:
+                break
+
+        # 3) 所有 sim_steps 完成后，计算sim_stpes平均频谱利用率，返回新的状态、累计奖励、done、info
+        sum_efficiency_per_frame /= sim_steps
+        next_state = self.get_state()
+
+        return next_state, cumulative_reward, done, sum_efficiency_per_frame, is_win
+
+    def render(self, sum_efficiency_per_frame, sum_efficiency_averaged,path_history=True):
+        # 加载环境背景图
+        env_picture = GetEnvironment(self.environment_name)
+        picture_path = env_picture.unit_data['picture']
+        self.background_img = Image.open(picture_path)
+        # 转成可在Tkinter中使用的图像
+        self.background_tkimg = ImageTk.PhotoImage(self.background_img)
+        self.canvas.delete("all")
+        # 先绘制背景图
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.background_tkimg)
+
+        # 画单位
+        for unit in self.unitList:
+            if not unit.crashed:
+                unit.display()
+        # 画通信链路
+        self.displayLinks()
+        # 画飞行中的导弹
+        for missile in self.flyingMissileList:
+            missile.display()
+
+        self.canvas.create_text(100, 560, text="平均频谱利用率：{:.4f}".format(sum_efficiency_averaged), fill='red',
+                                font=('Arial', 12))
+        self.canvas.create_text(100, 580, text="时隙频谱利用率：{:.4f}".format(sum_efficiency_per_frame), fill='red',
+                                font=('Arial', 12))
+        if path_history:
+            # === 飞机飞行轨迹 ===
+            for unit in self.unitList:
+                if len(unit.path_history) > 1:
+                    # 通过列表推导提取 (x, y) 平面坐标，忽略 z
+                    coords = [coord for point in unit.path_history for coord in point[:2]]
+                    if len(coords) < 4:
+                        continue  # 至少需要两个点 (4 个值)
+
+                    color = "red" if unit.color == "red" else "blue"
+                    self.canvas.create_line(coords, fill=color, width=0.5, smooth=True)
+
+        self.window.update()
+
+    def close(self):
+        # 安全关闭窗口
+        if self.window:
+            try:
+                self.window.destroy()
+            except Exception as e:
+                print(f"窗口关闭异常: {e}")
+            self.window = None
+
 
 class Network:
     def __init__(self,
@@ -705,12 +1421,23 @@ class Radar:
         self.dis = 0 # 探测距离
 
         #for i in range(beamNum):
-        #    radarBeam = Beam(battleField=battleField,
+        #    radarBeam = Beam(battleField=self.battleField,
         #                     source=self,
         #                     type='radarBeam',
         #                     )
         #    radarBeam.set_centerFrequency(10 * 1e9)
         #    radarBeam.set_bandwidth(200 * 1e6)
+
+
+    def calculate_max_detection_distance(self):
+        # 把雷达波束频率先设定成10 * 1e9
+        max_detection_distance = (self.beamPower * (self.gain ** 2) * ((3e8 / 10 * 1e9) ** 2)) / \
+                                 ((4 * np.pi) ** 3 * self.lossFactor * self.Threshold * 1.38e-23 * 290 * 10 * 1e9 * \
+                                  10 ** (self.noiseFigure / 10))
+        if self.unit.radar.on:
+            return max_detection_distance
+        else:
+            return 0
 
     def cal_detection_range(self):
         k = 1.38e-23  # 玻尔兹曼常数
@@ -907,7 +1634,6 @@ class Radar:
                                 source=self,
                                 type=type,
                                 workMode=workMode,
-
                                 angleRange=self.beamAngleRange,
                                 pitchRange=self.beamPitchRange,
                                 centerFrequency=centerFrequency,
@@ -1077,12 +1803,14 @@ class Beam:
 
         # （self干扰别人）关闭被干扰单位的被干扰波束列表的干扰波
         for lockedUnit in self.lockedUnitList:
-            lockedUnit.lockedByBeamList.remove(self)
+            if self in lockedUnit.lockedByBeamList: # TODO
+                lockedUnit.lockedByBeamList.remove(self)
             if lockedUnit.unitIndex in self.battleField.jammedDict:
                 del self.battleField.jammedDict[lockedUnit.unitIndex]
         # （别人干扰self）关闭自己被干扰波束列表的干扰波
         for lockedByBeam in self.lockedByBeamList:
-            lockedByBeam.lockedUnitList.remove(self.unit)
+            if self.unit in lockedByBeam.lockedUnitList: # TODO
+                lockedByBeam.lockedUnitList.remove(self.unit)
             if lockedUnit.unitIndex in self.battleField.jammedDict:
                 del self.battleField.jammedDict[lockedUnit.unitIndex]
             # del self.battleField.jammedDict[self.unit.unitIndex]
@@ -1142,8 +1870,8 @@ class Beam:
                 fillColor = 'Aqua'
 
             # 获取画布的尺寸
-            canvas_width = battleField.canvas.winfo_width()
-            canvas_height = battleField.canvas.winfo_height()
+            canvas_width = self.battleField.canvas.winfo_width()
+            canvas_height = self.battleField.canvas.winfo_height()
 
             # 使用一个大的值来模拟无限远（这里采用画布的对角线长度的两倍）
             radius = (canvas_width ** 2 + canvas_height ** 2) ** 0.5 * 2
@@ -1154,7 +1882,7 @@ class Beam:
             if self.unit.color == 'red' or self.unit.color == 'blue':
                 if self.angleRange[0] < (2 * np.pi):
                     # 绘制圆弧
-                    self.image = battleField.canvas.create_arc(
+                    self.image = self.battleField.canvas.create_arc(
                         bounds,
                         start=(-self.direction[0] - self.angleRange[0] / 2) / np.pi * 180,
                         extent=self.angleRange[0] / np.pi * 180,
@@ -1163,7 +1891,7 @@ class Beam:
                     )
                 else:
                     # 绘制完整的圆
-                    self.image = battleField.canvas.create_oval(
+                    self.image = self.battleField.canvas.create_oval(
                         bounds,
                         fill=fillColor,
                         outline=fillColor,
@@ -1256,7 +1984,7 @@ class Jammer:
             self.angleRangeList.append(newJammingBeam.angleRange)
             self.pitchRangeList.append(newJammingBeam.pitchRange)
         else:
-            print('Reach MaxBeamNum!')
+            # print('Reach MaxBeamNum!')
             newJammingBeam = None
         return newJammingBeam
 
@@ -1653,9 +2381,9 @@ class Link:
     def get_linkDistanceUnderJamming(self):
         # linkDistance = -1
         linkDistance = self.calculate_distance()
-        # todo 调试信息：查看battleField.jammedDict
+        # todo 调试信息：查看self.battleField.jammedDict
         # print("==============================")
-        # print(battleField.jammedDict)
+        # print(self.battleField.jammedDict)
         # print("==============================")
         return linkDistance
 
@@ -1715,6 +2443,8 @@ class Communicator:
         for recvLink in receiver.communicator.recvLinkList:
             if recvLink.centerFrequency in validFrequencyList:
                 validFrequencyList.remove(recvLink.centerFrequency)
+        if not validFrequencyList:
+            validFrequencyList = list(self.hopFrequencyList)  # TODO 如果为空，重新使用完整的频率列表
         link.set_centerFrequency(validFrequencyList[0])
         link.set_bandwidth(25 * 1e3)
 
@@ -1733,6 +2463,10 @@ class Communicator:
         for recvLink in receiver.communicator.recvLinkList:
             if recvLink.centerFrequency in freeFrequencyList:
                 freeFrequencyList.remove(recvLink.centerFrequency)
+
+        # TODO 确保 freeFrequencyList 不为空
+        if not freeFrequencyList:
+            freeFrequencyList = list(self.hopFrequencyList)  # 如果为空，重新使用完整的频率列表
 
         # todo: 设置链路频率与带宽
         link.set_centerFrequency(freeFrequencyList[0])
@@ -1782,7 +2516,7 @@ class Navigator:
         self.speed = speed
         self.acc = acc
         #三维DWA算法
-        self.dt = battleField.simTimeInterval
+        self.dt = self.battleField.simTimeInterval
         # #各轴最大速度
         # self.v_max = [self.unit.speed*self.arg, self.unit.speed*self.arg, self.unit.speed*self.arg]
         # #各轴最小速度
@@ -1873,7 +2607,7 @@ class Navigator:
         norm_velocity_vector = np.linalg.norm(velocity_vector)
 
         # 使用反余弦函数计算角度
-        theta = np.pi - np.arccos(dot_product / (norm_position_to_endpoint * norm_velocity_vector))
+        theta = np.pi - safe_arccos(dot_product / (norm_position_to_endpoint * norm_velocity_vector + 1e-10))
 
         # 确定 heading 的值
         if theta <= 0:
@@ -1908,7 +2642,7 @@ class Navigator:
     def __distence(self, trajectory, end_point):
         state = trajectory[-1]
         location = [state[0], state[1], state[2]]
-        distence = battleField.get_distance(location, end_point)
+        distence = self.battleField.get_distance(location, end_point)
         if distence != 0:
             return 10 / distence
         else:
@@ -1974,7 +2708,7 @@ class Navigator:
 
         self.path = path
         self.movePlan = []
-        stride = self.unit.speed * battleField.simTimeInterval
+        stride = self.unit.speed * self.battleField.simTimeInterval
         startPoint = self.unit.position
         for i in range(len(path)):
             nextPointDistance = self.battleField.get_distance(startPoint, path[i])
@@ -2081,10 +2815,10 @@ class Missile:
                                )
         if self.type == 'normal':
             self.unit.normalMissileList.remove(self)
-            print('%s launches normal missile to %s !' % (self.unit.unitIndex, self.target.unitIndex))
+            # print('%s launches normal missile to %s !' % (self.unit.unitIndex, self.target.unitIndex))
         elif self.type == 'antiRadiation':
             self.unit.antiRadiationMissileList.remove(self)
-            print('%s launches antiRadiation missile!' % self.unit.unitIndex)
+            # print('%s launches antiRadiation missile!' % self.unit.unitIndex)
         self.unit.equipments.remove(self)
         self.battleField.flyingMissileList.append(self)
 
@@ -2097,7 +2831,7 @@ class Missile:
             if targetDistance <= self.stride:
                 self.crash()
                 if np.random.randint(0, 100) < (100 * self.hitRate):
-                    print('%s destroyed %s' % (self.unit.unitIndex, self.target.unitIndex))
+                    # print('%s destroyed %s' % (self.unit.unitIndex, self.target.unitIndex))
                     #print('%s\'s jammer is locking ' % self.target.unitIndex, end=',  ')
                     #for jammingBeam in self.target.jammer.beamList:
                     #    for lockedBeam in jammingBeam.lockedBeamList:
@@ -2140,7 +2874,7 @@ class Missile:
 
     def display(self):  #只展示二维俯视图
         if self.launched and not self.crashed and self.displayEnable:
-            self.image = battleField.canvas.create_oval(self.position[0] - 4,
+            self.image = self.battleField.canvas.create_oval(self.position[0] - 4,
                                                         self.position[1] - 4,
                                                         self.position[0] + 4,
                                                         self.position[1] + 4,
@@ -2254,14 +2988,14 @@ class Unit:
         self.lockedByBeamList = []
 
         if self.withMonitor:
-            self.monitor = Monitor(battleField=battleField,
+            self.monitor = Monitor(battleField=self.battleField,
                                    unit=self,
                                    type='monitor',
                                    sensitivity=0, )
 
         if self.withJammer:
             if self.name == 'fighter':
-                self.jammer = Jammer(battleField=battleField,
+                self.jammer = Jammer(battleField=self.battleField,
                                      unit=self,
                                      maxBeamNum=2,
                                      maxEffectiveDistance=100,
@@ -2269,7 +3003,7 @@ class Unit:
                                      beamPitchRange=[-60, 60]
                                      )
             else:
-                self.jammer = Jammer(battleField=battleField,
+                self.jammer = Jammer(battleField=self.battleField,
                                      unit=self,
                                      maxBeamNum=20,
                                      maxEffectiveDistance=100,
@@ -2278,7 +3012,7 @@ class Unit:
                                      )
 
         if self.withCommunicator:
-            self.communicator = Communicator(battleField=battleField,
+            self.communicator = Communicator(battleField=self.battleField,
                                              type='air2air',
                                              unit=self,
                                              maxCommunicationDistance=560,
@@ -2286,33 +3020,35 @@ class Unit:
 
         if self.withNavigator:
             if self.type == 'plane':
-                self.navigator = Navigator(battleField=battleField,
+                self.navigator = Navigator(battleField=self.battleField,
                                            type='planeNavigator',
                                            speed=self.speed,
                                            acc=self.acc,
                                            unit=self)
             if self.type == 'ship':
-                self.navigator = Navigator(battleField=battleField,
+                self.navigator = Navigator(battleField=self.battleField,
                                            type='shipNavigator',
                                            speed=self.speed,
                                            acc=self.acc,
                                            unit=self)
             if self.type == 'ground':
-                self.navigator = Navigator(battleField=battleField,
+                self.navigator = Navigator(battleField=self.battleField,
                                            type='groundNavigator',
                                            speed=self.speed,
                                            acc=self.acc,
                                            unit=self)
 
         if self.withRadar:
-            self.radar = Radar(battleField=battleField, type='selfDefense', unit=self, maxEffectiveDistance=100)
+            self.radar = Radar(battleField=self.battleField, type='selfDefense', unit=self, maxEffectiveDistance=100)
 
         self.normalMissileList = []
         self.antiRadiationMissileList = []
 
+        self.adaptiveControl = False
+
         if self.name == 'fighter':
             for i in range(normalMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   speed=Plane_Missile_speed,
                                   type='normal',
@@ -2320,7 +3056,7 @@ class Unit:
                                   )
                 self.normalMissileList.append(missile)
             for i in range(antiRadiationMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   type='antiRadiation',
                                   speed=Plane_Missile_speed,
@@ -2330,7 +3066,7 @@ class Unit:
 
         if self.name == 'Destroyer':
             for i in range(normalMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   speed=Destroyer_Missile_speed,
                                   type='normal',
@@ -2338,7 +3074,7 @@ class Unit:
                                   )
                 self.normalMissileList.append(missile)
             for i in range(antiRadiationMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   type='antiRadiation',
                                   speed=Destroyer_Missile_speed,
@@ -2347,7 +3083,7 @@ class Unit:
                 self.antiRadiationMissileList.append(missile)
         if self.name == 'ground_air_defense_missile_rack':
             for i in range(normalMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   speed=ground_Missile_speed,
                                   type='normal',
@@ -2355,7 +3091,7 @@ class Unit:
                                   )
                 self.normalMissileList.append(missile)
             for i in range(antiRadiationMissileNum):
-                missile = Missile(battleField=battleField,
+                missile = Missile(battleField=self.battleField,
                                   name='fox%d' % i,
                                   type='antiRadiation',
                                   speed=ground_Missile_speed,
@@ -2412,15 +3148,96 @@ class Unit:
             self.shapeImage_0 = None
         self.image = None
 
-        battleField.add_unit(self)
+        self.battleField.add_unit(self)
 
         #if self.color == 'red':
-        #    battleField.redUnitList.append(self)
+        #    self.battleField.redUnitList.append(self)
         #elif self.color == 'blue':
-        #    battleField.blueUnitList.append(self)
+        #    self.battleField.blueUnitList.append(self)
 
     def get_unitIndex(self):
         return self.unitIndex
+
+
+
+    def adaptive_control(self):
+        """自适应控制算法"""
+        # 获取当前威胁矩阵
+        threat_index = ThreatIndex(self.battleField, self)
+        threat_index.update_threat_matrix()
+        # 计算当前所有威胁之和
+        threat_sum = sum(sum(row) for row in threat_index.threatMatrix)
+        # print("当前威胁值：", threat_sum)
+        # # todo：如果当前对我方飞机集群的整体威胁（所有威胁）大于门限值 10，则调整我方战机位置，如小于10则继续执行任务
+        # if threat_sum >= 5:
+        #     print("-----------超过阈值,当前威胁值：", threat_sum)
+            # if self.name == 'EJA' and self.color == 'red':
+            #     self.adaptiveControl = True
+
+        if threat_sum < 5:
+            self.adaptiveControl = False
+
+        # 获取有效敌方列表
+        enemies = [u for u in self.battleField.unitList
+                   if u.color != self.color and not u.crashed]
+
+        max_threat = 0
+        target = None
+
+        # 选出对我方飞机集群的威胁值最大的敌方单位
+        # 使用枚举确保索引对应
+        for i, enemy in enumerate(enemies):
+            try:
+                current_threat = sum(threat_index.threatMatrix[i])
+            except (IndexError, ValueError):
+                current_threat = 0
+
+            if current_threat > max_threat:
+                max_threat = current_threat
+                target = enemy
+
+        # 动态参数调整
+        if target:
+
+            distance = self.battleField.get_distance(self.position, target.position)
+
+            # 干扰功率控制（Sigmoid函数调节）
+            # todo：这个应该适用于对地方所有单位的干扰功率控制
+            # Alpha = 0.08  # 调节sigmoid函数的图像，α等于0.1时，j_factor大约在d=100时候开始小于1；α等于0.01时，j_factor大约在d=600时候开始小于1
+            # jammer_factor = 1 / (1 + np.exp(-Alpha * (distance - 50)))  # d越远干扰越强，d越近干扰越弱，d=50时候jammer_factor=0.5
+            # self.jammer.beamPower = jammer_factor * 1e8
+
+            # 速度控制（分段函数）
+            # if distance > 350:
+            #     self.navigator.v_max = [self.speed * 1.5] * 3  # 高速接近
+            # elif 100 < distance <= 350:
+            #     self.navigator.v_max = [self.speed] * 3  # 巡航速度
+            # else:
+            #     self.navigator.v_max = [self.speed * 0.8] * 3  # 低速机动
+
+            # 频率捷变（伪随机跳频）
+            # if hasattr(self, 'frequency_hop_counter'):
+            #     self.frequency_hop_counter += 1
+            #     if self.frequency_hop_counter >= 5:  # 每5个时隙跳频
+            #         if self.radar.beamList:
+            #             self.radar.beamList[0].centerFrequency = random.randint(int(8e9), int(12e9))
+            #             self.frequency_hop_counter = 0
+            # else:
+            #     self.frequency_hop_counter = 0
+
+            # 武器资源分配
+            if target not in self.aimingTargetList and distance < self.attackRange and self.attackEnable \
+                    and self.normalMissileNum > 0:
+                if len(target.trackedByMissileList) < 2:  # 每个目标最多分配2枚导弹
+                    self.aimingTargetList.append(target)
+                    # 根据当前威胁指数选择导弹数量
+                    self.add_schedule(func=self.attack,
+                                      args=(target, 'normal', 1),
+                                      delay=5,
+                                      )
+
+
+
     def set_moveDirection(self, moveDirection):
         self.moveDirection[0] = moveDirection / 180 * np.pi
 
@@ -2502,16 +3319,16 @@ class Unit:
         # 速度、加速度都变成三维的
         # s = v0*t+0.5*a*t**2
         self.position[0] += (
-                                    self.speed * battleField.simTimeInterval + 0.5 * self.acc * battleField.simTimeInterval ** 2) * np.sin(
+                                    self.speed * self.battleField.simTimeInterval + 0.5 * self.acc * self.battleField.simTimeInterval ** 2) * np.sin(
             self.moveDirectionPitch[0]) * np.cos(self.moveDirection[0])
         self.position[1] += (
-                                    self.speed * battleField.simTimeInterval + 0.5 * self.acc * battleField.simTimeInterval ** 2) * np.sin(
+                                    self.speed * self.battleField.simTimeInterval + 0.5 * self.acc * self.battleField.simTimeInterval ** 2) * np.sin(
             self.moveDirectionPitch[0]) * np.sin(self.moveDirection[0])
         self.position[2] += (
-                                    self.speed * battleField.simTimeInterval + 0.5 * self.acc * battleField.simTimeInterval ** 2) * np.cos(
+                                    self.speed * self.battleField.simTimeInterval + 0.5 * self.acc * self.battleField.simTimeInterval ** 2) * np.cos(
             self.moveDirectionPitch[0])
 
-        self.speed += self.acc * battleField.simTimeInterval
+        self.speed += self.acc * self.battleField.simTimeInterval
 
     def plot_plane(self, x, y, direction):
         circle = plt.Circle((x, y), 20, color="b")
@@ -2537,7 +3354,7 @@ class Unit:
 
         # goal = goals[0]
         # u, predicted_trajectory = self.navigator.dwa_control(x, goal)
-        # x = self.navigator.kinematicModel(x, u, battleField.simTimeInterval)
+        # x = self.navigator.kinematicModel(x, u, self.battleField.simTimeInterval)
         # self.position[0] += x[0]
         # self.position[1] += x[1]
         # self.position[2] += x[2]
@@ -2550,12 +3367,12 @@ class Unit:
         while len(goals) > 0:
             goal = goals[0]
             u, predicted_trajectory = self.navigator.dwa_control(x, goal)
-            x = self.navigator.kinematicModel(x, u, battleField.simTimeInterval)
+            x = self.navigator.kinematicModel(x, u, self.battleField.simTimeInterval)
             self.position[0] = x[0]
             self.position[1] = x[1]
             self.position[2] = x[2]
             trajectory = np.vstack((trajectory, x))
-            if battleField.get_distance(self.position, goal) < 3:
+            if self.battleField.get_distance(self.position, goal) < 3:
                 print("Goal 1 Reached!!")
                 goals = goals[1:]
             print(goal)
@@ -2576,18 +3393,18 @@ class Unit:
 
     def move_by_static(self):
         # if len(self.navigator.path) > 0:
-        #     if battleField.get_distance(self.position, self.goal) < 3:
+        #     if self.battleField.get_distance(self.position, self.goal) < 3:
         #         del self.navigator.path[0]
         if self.name == 'EJA' or self.name == 'EWA' or self.name == 'fighter':
             if len(self.navigator.path) > 0:
                 self.goal = self.navigator.path[0]
                 # 距离目标点2km即到达
-                if battleField.get_distance(self.position, self.goal) < 2:
+                if self.battleField.get_distance(self.position, self.goal) < 2:
                     # del self.navigator.path[0]
                     self.navigator.path = self.navigator.path[1:]
             # print("self.goal", self.navigator.path)
             v, predicted_trajectory = self.navigator.dwa_control(self.state, self.goal)
-            self.state = self.navigator.kinematicModel(self.state, v, battleField.simTimeInterval)
+            self.state = self.navigator.kinematicModel(self.state, v, self.battleField.simTimeInterval)
             self.position[0] = self.state[0]
             self.position[1] = self.state[1]
             self.position[2] = self.state[2]
@@ -2605,21 +3422,34 @@ class Unit:
         基于目标位置，通过三维DWA算法来控制飞机飞行，每次只更新一步,更新self.position
         """
 
+        # 如果有路径，就取第一个航点作为目标
         if len(self.navigator.path) > 0:
             self.goal = self.navigator.path[0]
+
             # 距离目标点3km即到达
-            if battleField.get_distance(self.position, self.goal) < 3:
+            if self.battleField.get_distance(self.position, self.goal) < 3:
                 del self.navigator.path[0]
 
+                # 删除后如果还有下一个航点，立刻更新 goal
+                if len(self.navigator.path) > 0:
+                    self.goal = self.navigator.path[0]
+                else:
+                    self.goal = None
+
+        # 关键保护：没有目标就不跑 DWA
+        if self.goal is None:
+            return
+
         v, predicted_trajectory = self.navigator.dwa_control(self.state, self.goal)
-        self.state = self.navigator.kinematicModel(self.state, v, battleField.simTimeInterval)
+        self.state = self.navigator.kinematicModel(self.state, v, self.battleField.simTimeInterval)
+
         self.position[0] = self.state[0]
         self.position[1] = self.state[1]
         self.position[2] = self.state[2]
         self.moveDirection[0] = self.navigator.cal_heading(self.state)
 
         # 限制飞机在地图内
-        if self.position[0] < 0:  # todo
+        if self.position[0] < 0:
             self.position[0] = 1
         if self.position[0] > 1000:
             self.position[0] = 999
@@ -2627,11 +3457,41 @@ class Unit:
             self.position[1] = 1
         if self.position[1] > 1000:
             self.position[1] = 999
+        if self.position[2] < 0:
+            self.position[2] = 1
 
         # print(self.goal)
         # print("%s+%s 当前的速度是: %s %s %s" % (self.color, self.name, self.state[3], self.state[4], self.state[5]))
         # print(f"{self.color}_{self.name} 当前的速度是: {self.state[3]} {self.state[4]} {self.state[5]}")
         # print(f"{self.color}_{self.name} 当前的坐标是: {self.state[0]} {self.state[1]} {self.state[2]}")
+
+    def move_by_MAAC(self, action):
+        """
+        通过 MADDPG_With_Attention 算法来控制飞机飞行
+        """
+        v_x, v_y, v_z = action
+        # 更新位置
+        self.position[0] += v_x * self.battleField.simTimeInterval
+        self.position[1] += v_y * self.battleField.simTimeInterval
+        self.position[2] += v_z * self.battleField.simTimeInterval
+        # 更新速度
+        self.state[3] = v_x
+        self.state[4] = v_y
+        self.state[5] = v_z
+        # 更新方向
+        self.moveDirection[0] = np.arctan2(v_y, v_x)
+        self.moveDirectionPitch[0] = np.pi / 2 - np.arctan2(v_z, np.sqrt(v_x ** 2 + v_y ** 2))
+        # 限制飞机在地图内
+        if self.position[0] < 0:
+            self.position[0] = 1
+        if self.position[0] > 1000:
+            self.position[0] = 999
+        if self.position[1] < 0:
+            self.position[1] = 1
+        if self.position[1] > 1000:
+            self.position[1] = 999
+        if self.position[2] < 0:
+            self.position[2] = 1
 
     def move2Target(self, target):
         if not target.crashed:
@@ -2654,7 +3514,7 @@ class Unit:
             if self.name == 'ship':
                 self.speed = 906 / 3600
 
-            self.acc = RedFighter_tracking_acc  # 没用不知道原因
+            self.acc = tracking_RedFighter_acc  # TODO 没用不知道原因
             self.navigator.v_max = [self.speed, self.speed, self.speed]
             self.navigator.v_min = [-self.speed, -self.speed, -self.speed]
             self.navigator.a_max = [self.acc, self.acc, self.acc]
@@ -2720,9 +3580,118 @@ class Unit:
         else:
             return False
 
+
+    def action_red(self, action):
+        self.schedule_action()
+        # todo:new
+        # if self.color == 'red' and not self.crashed:
+        #     self.adaptive_control()
+
+        for target in self.radar.detectedUnits:
+            self.jammer.jam_targetUnit(target)
+
+        # if self.unitIndex > 1 and not self.normalMissileList:
+        #     print('%d_NormalMissile Lack' % self.unitIndex)
+        if self.unitIndex > 1 and not self.normalMissileList:  # 海和地会显示index大于1，list为空
+            # print("index", self.unitIndex)
+            # print(self.normalMissileList)
+            # print('%d_NormalMissile Lack'%self.unitIndex)
+            pass
+
+        if self.targetedByList:
+            # print('%d_targetedBy =' % self.unitIndex, end='')
+            # for unit in self.targetedByList:
+            #     print(unit.unitIndex, end=',')
+            # print('\n')
+            pass
+        # if self.unitIndex==2:
+        #     print('detectedUnits =', end='')
+        #     for unit in self.radar.detectedUnits:
+        #         print(unit.unitIndex, end=',')
+        #     print('\n')
+        if self.attackEnable and self.normalMissileList:
+            # if not self.radar.detectedUnits:
+            # self.fightingFlag = False
+            #    pass
+            if self.radar.detectedUnits:
+                if not self.fightingFlag:
+                    # if self.unitIndex==2:
+                    #     print('detectedUnits =', end='')
+                    #     for unit in self.radar.detectedUnits:
+                    #         print(unit.unitIndex, end=',')
+                    #     print('\n')
+                    for target in self.radar.detectedUnits:
+                        if target.color != self.color and not target.targetedByList and not self.fightingFlag:
+                            if self.unitIndex == 2:
+                                maxTrackingDistance = 250
+                            else:
+                                maxTrackingDistance = 400
+
+                            # 加入蓝色战斗机的追击距离
+                            if self.color == 'blue' and self.name == 'fighter':
+                                maxTrackingDistance = 300
+
+                            if self.battleField.distanceMatrix[0, target.unitIndex] <= maxTrackingDistance:
+                                self.tracking(target, maxTrackingDistance)
+                                break
+                for target in self.radar.detectedUnits:
+                    if target.color != self.color:
+                        # self.move2Target(target)
+                        # self.fightingFlag = True
+                        # self.speed = 1800/3600
+                        if target not in self.aimingTargetList \
+                                and self.battleField.distanceMatrix[
+                            self.unitIndex, target.unitIndex] < self.attackRange:
+                            self.aimingTargetList.append(target)
+                            self.add_schedule(func=self.attack,
+                                              args=(target, 'normal', 1),
+                                              delay=5,
+                                              )
+
+        if self.attackEnable and self.antiRadiationMissileList:
+            # todo:修改了反辐射雷达发射条件:有敌方波束照到搭载反辐射导弹的单位且波束功率过大
+            if self.lockedByBeamList:
+                for lockedBeam in self.lockedByBeamList:
+                    if lockedBeam.unit not in self.aimingTargetList and not lockedBeam.unit.crashed and \
+                            len(lockedBeam.unit.trackedByMissileList) < 1 and \
+                            self.battleField.distanceMatrix[self.unitIndex, lockedBeam.unit.unitIndex] \
+                            < self.antiAttackRange:
+                        # 设置反辐射雷达导弹的发射范围为：antiAttackRange即普通导弹+100
+                        self.aimingTargetList.append(lockedBeam.unit)
+                        self.add_schedule(func=self.attack,
+                                          args=(lockedBeam.unit, 'antiRadiation', 1),
+                                          delay=5, )
+        # print('fightingFlag =', self.battleField.unitList[2].fightingFlag)
+        # todo:调节guard和躲避敌机位置两种冲突的策略
+        # if self.color == 'red' and self.unitIndex != 0 and not self.fightingFlag and not self.adaptiveControl:
+        #     self.guard(self.battleField.unitList[0])
+        if self.color == 'red' and self.name == 'EJA':
+            self.guard(self.battleField.unitList[0])
+        if self.battleField.environment_name == 'air-air' or self.battleField.environment_name == 'air-sea':
+            if self.color == 'blue':
+                self.move_by_DWA()
+            if self.color == 'red' and self.name == 'fighter':
+                self.move_by_MAAC(action)
+            if self.color == 'red' and self.name == 'EJA':
+                # print('%d_EJA adaptiveControl' % self.unitIndex)
+                bluePosition = []
+                for target in self.radar.detectedUnits:
+                    bluePosition.append(target.position)
+                self.move_by_DWA()
+            if self.color == 'red' and self.name == 'EJA':
+                self.move_by_DWA()
+        elif self.battleField.environment_name == 'air-ground':
+            self.move_by_static()
+
     def action(self):
 
         self.schedule_action()
+
+        if self.color == 'blue' and not self.crashed:
+            start_time = time.time()
+            self.adaptive_control()
+            end_time = time.time()
+            # print("决策时间:", end_time - start_time+0.005)
 
         for target in self.radar.detectedUnits:
             self.jammer.jam_targetUnit(target)
@@ -2803,10 +3772,7 @@ class Unit:
             self.guard(self.battleField.unitList[0])
 
         if self.battleField.environment_name == 'air-air' or self.battleField.environment_name == 'air-sea':
-            if self.color == 'red' and self.name == 'fighter':
-                self.move_by_MADDPG()
-            else:
-                self.move_by_DWA()
+             self.move_by_DWA()
         elif self.battleField.environment_name == 'air-ground':
             self.move_by_static()
 
@@ -2815,7 +3781,7 @@ class Unit:
         self.battleField.crashedUnitList.append(self)
         for equipment in self.equipments:
             equipment.crash()
-        print('%s crashed' % self.unitIndex)
+        # print('%s crashed' % self.unitIndex)
 
     def add_schedule(self, func, args, delay):
         item = {'func': func,
@@ -2847,11 +3813,11 @@ class Unit:
                 if self.name == 'fighter':
 
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 10,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 10,
                                                                  self.position[1] - 10,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
-                    self.textImage = battleField.canvas.create_text(self.position[0],
+                    self.textImage = self.battleField.canvas.create_text(self.position[0],
                                                                     self.position[1],
                                                                     text=self.unitIndex,
                                                                     font=('Purisa', 15),
@@ -2860,76 +3826,72 @@ class Unit:
                 elif self.name == 'EJA':
 
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 15,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 15,
                                                                  self.position[1] - 15,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
                 elif self.name == 'EWA':
 
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 20,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 20,
                                                                  self.position[1] - 20,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
 
                 elif self.name == 'Destroyer':
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 20,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 20,
                                                                  self.position[1] - 20,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
                 elif self.name == 'SurfaceShip':
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 20,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 20,
                                                                  self.position[1] - 20,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
                 elif self.name == 'ground_radar':
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 20,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 20,
                                                                  self.position[1] - 20,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
 
                 elif self.name == 'ground_air_defense_missile_rack':
                     self.shapeImage = ImageTk.PhotoImage(self.shapeImage_0.rotate(-self.moveDirection[0] / np.pi * 180))
-                    self.image = battleField.canvas.create_image(self.position[0] - 20,
+                    self.image = self.battleField.canvas.create_image(self.position[0] - 20,
                                                                  self.position[1] - 20,
                                                                  anchor=tk.NW,
                                                                  image=self.shapeImage)
 
 
             else:
-                self.image = battleField.canvas.create_oval(self.position[0] - 8,
+                self.image = self.battleField.canvas.create_oval(self.position[0] - 8,
                                                             self.position[1] - 8,
                                                             self.position[0] + 8,
                                                             self.position[1] + 8,
                                                             fill=self.color
                                                             )
-                self.crashFlag0 = battleField.canvas.create_line(self.position[0] - 8,
+                self.crashFlag0 = self.battleField.canvas.create_line(self.position[0] - 8,
                                                                  self.position[1] - 8,
                                                                  self.position[0] + 8,
                                                                  self.position[1] + 8,
                                                                  fill='black',
                                                                  width=2,
                                                                  )
-                self.crashFlag1 = battleField.canvas.create_line(self.position[0] + 8,
+                self.crashFlag1 = self.battleField.canvas.create_line(self.position[0] + 8,
                                                                  self.position[1] - 8,
                                                                  self.position[0] - 8,
                                                                  self.position[1] + 8,
                                                                  fill='black',
                                                                  width=2,
                                                                  )
-                self.textImage = battleField.canvas.create_text(self.position[0],
+                self.textImage = self.battleField.canvas.create_text(self.position[0],
                                                                 self.position[1],
                                                                 text=self.unitIndex,
                                                                 font=('Purisa', 8),
                                                                 fill='white'
                                                                 )
-
-    def move_by_MADDPG(self):
-        self.moveDirection[0] = self.navigator.cal_heading(self.state)
-        pass
 
 
 class Get_Unit:
@@ -3292,8 +4254,12 @@ def generating_unit(name, color, geospatial, battleField, number):
                          )
     return a
 
-
-
+RedFighter = Get_Unit('RedFighter')
+RedFighter_tracking_speed = RedFighter.unit_data['max_rate_for_tracking']
+tracking_RedFighter_acc = RedFighter.unit_data['max_acceleration_for_tracking'] / 1000
+Plane_Missile_speed = RedFighter.unit_data.get('air_to_air_missile', {}).get('max_rate')
+Destroyer = Get_Unit('Destroyer')
+Destroyer_Missile_speed = Destroyer.unit_data.get('ground_to_air_missile', {}).get('max_rate')
 
 if __name__ == '__main__':
     # air-sea、air-air、air-ground
@@ -3304,7 +4270,7 @@ if __name__ == '__main__':
         # 红方战斗机追踪目标最大速度(km/h)2410
         RedFighter_tracking_speed = RedFighter.unit_data['max_rate_for_tracking']  #todo需要这个吗？
         # 红方战斗机追踪目标时的加速度(km/s**2)0.075
-        RedFighter_tracking_acc = RedFighter.unit_data['max_acceleration_for_tracking'] / 1000  # todo
+        tracking_RedFighter_acc = RedFighter.unit_data['max_acceleration_for_tracking'] / 1000  # todo
         # 导弹速度(km/h)7200
         # todo暂时设置红方蓝方导弹速度相同
         Plane_Missile_speed = RedFighter.unit_data.get('air_to_air_missile', {}).get('max_rate')
@@ -3401,7 +4367,6 @@ if __name__ == '__main__':
             #                     maxInfluenceDistance=100,
             #                     )
             redPlane.navigator.v_sample = 0.03
-
             redPlane.radar.turn_on()
             redPlane.jammer.set_beamAngleRange(1)
             redPlane.jammer.beamPower = 40 * 1e3
@@ -3543,7 +4508,6 @@ if __name__ == '__main__':
         destroyer.navigator.v_sample = 0.005
         destroyer.monitor.on = False
         destroyer.radar.turn_on()
-        destroyer.radar.beamPower = 5 * 1e6
         # 设置干扰机干扰角度 unit类中self.jammer
         destroyer.jammer.set_beamAngleRange(1)
         destroyer.jammer.set_beamPitchRange([-70, 90])
@@ -3766,7 +4730,7 @@ if __name__ == '__main__':
             ground_air_defense_missile_rack = generating_unit('ground_air_defense_missile_rack', 'blue', 'ground', battleField, i)
             ground_air_defense_missile_rack.jammer.on = True
             ground_air_defense_missile_rack.jammer.beamPower = 10 * 1e6
-            ground_air_defense_missile_rack.monitor.on = False
+            ground_air_defense_missile_rack.monitor.on = False  # TODO
             ground_air_defense_missile_rack.radar.turn_on()
             ground_air_defense_missile_rack.radar.beamPower = 10 * 1e6
             ground_air_defense_missile_rack.jammer.set_maxEffectiveDistance(700)

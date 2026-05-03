@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 from src.algorithm.prioritized_replay_buffer import PrioritizedReplayBuffer
 from src.algorithm.maac_agent import MAACAgent
-from src.battleField import BattleField, generating_unit  # 导入战场环境
+from src.battleField import BattleField, generating_unit,Get_Unit  # 导入战场环境
 
 import matplotlib
 
