@@ -9,12 +9,13 @@ from src.algorithm.maac_agent import MAACAgent
 from src.battleField import BattleField, generating_unit  # 导入战场环境
 
 import matplotlib
+
 matplotlib.use('Agg')  # 使用非交互式后台，以免误弹出GUI窗口
 
 if __name__ == "__main__":
     # 创建保存模型和图形的目录
-    os.makedirs("models_path", exist_ok=True)
-    os.makedirs("figures_path", exist_ok=True)
+    os.makedirs("../logs/models_path", exist_ok=True)
+    os.makedirs("../logs/figures_path", exist_ok=True)
 
     # 设置随机种子，保证实验可重复
     np.random.seed(0)
@@ -27,15 +28,15 @@ if __name__ == "__main__":
     max_episodes = 200
     batch_size = 512  # 每次从经验缓存中取出的经验数
     replay_buffer_size = 500000
-    update_after = 1500 * 5   # 前5个Episode不更新模型，即随机探索过程
+    update_after = 1500 * 5  # 前5个Episode不更新模型，即随机探索过程
     update_every = 10  # 更新频率，每交互 10 步执行一次更新
 
     # 日志容器
     actor_losses, critic_losses = [], []
     agent_rewards_history = [[] for _ in range(5)]  # 5 个智能体
     sum_efficiency_averaged_history = []
-    win_history = [] # 记录每回合是否获胜(击毁蓝方驱逐舰)
-    win_rate_history = [] # 统计胜率
+    win_history = []  # 记录每回合是否获胜(击毁蓝方驱逐舰)
+    win_rate_history = []  # 统计胜率
 
 
     # 定义状态的归一化函数
@@ -49,8 +50,9 @@ if __name__ == "__main__":
         s = (s + 1.0) * 0.5
         return s.astype(np.float32)
 
+
     # 获取智能体数量（仅红方战斗机）
-    num_agents = 5 #（仅红方5架战斗机）
+    num_agents = 5  # （仅红方5架战斗机）
     agent = MAACAgent(state_dim=state_dim, action_dim=action_dim, num_agents=num_agents)
     replay_buffer = PrioritizedReplayBuffer(capacity=replay_buffer_size, alpha=0.6, beta=0.4)
     Average_rewards = []
@@ -208,14 +210,14 @@ if __name__ == "__main__":
         while not done:
             step += 1
             # 1. 选择动作（策略网络输出 + OU 探索噪声）
-            actions = agent.select_action(state) # → shape = (5, 3)
+            actions = agent.select_action(state)  # → shape = (5, 3)
             # 2. 与环境交互
-            next_state, reward, done, sum_efficiency_per_frame, is_win= env.rl_step(actions)
+            next_state, reward, done, sum_efficiency_per_frame, is_win = env.rl_step(actions)
             next_state = normalize_state(next_state)  # 将状态进行归一化处理
             win_step.append(is_win)
             # 3. 累积奖励并存储经验
             episode_reward += np.mean(reward)
-            agent_episode_rewards += reward          # 逐智能体
+            agent_episode_rewards += reward  # 逐智能体
             replay_buffer.add((state, actions, reward, next_state, done))
 
             # 记录当前时间平均频谱利用率
